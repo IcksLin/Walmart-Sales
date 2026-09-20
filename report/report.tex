@@ -1,0 +1,484 @@
+\documentclass[UTF8,a4paper,11pt]{ctexart}
+
+\usepackage{geometry}
+\geometry{left=2.4cm,right=2.4cm,top=2.6cm,bottom=2.6cm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\graphicspath{%
+  {../output/}%
+  {../output/line_1/pictures/}%
+  {../output/line_2/pictures/}%
+  {../output/line_3/pictures/}%
+  {../output/line_4/pictures/}%
+}
+
+\captionsetup{font=small,labelfont=bf}
+\setlength{\emergencystretch}{2em}
+\pagestyle{plain}
+\title{Walmart 周销售额影响因素分析与预测\\ \large 技术报告}
+\author{数据分析与建模实践}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+本报告使用 Walmart 45 家门店、143 周（2010-02-05 至 2012-10-26，共 6435 条）的周销售额数据，
+回答哪些因素影响销售额，以及如何对未来周销售额做出稳健预测。
+分析上先做结构化审计与去混淆清洗，再通过固定效应回归、SHAP 与滞后/滚动特征解释影响因素；
+预测上采用 DTW 动态时间规整 + 层次聚类对门店分组，并为每个聚类分别训练一个 XGBoost
+（记为 \texttt{B\_cluster}），与全局池化和单店建模作对照。
+所有模型在扩展窗口滚动交叉验证下评估，主指标为 Walmart 官方加权绝对误差 WMAE（节假日周权重为 5）。
+\texttt{B\_cluster} 表现最好：滚动 CV 汇总的 WMAE 为 58{,}500、WAPE 为 0.0472、$R^2$ 为 0.9812；
+末段留出（最后 13 周）的 WMAE 为 35{,}977、WAPE 为 0.0329、$R^2$ 为 0.9913，最差门店误差也低于 7\%。
+此外，销售额主要由门店自身历史动量与规模决定，宏观变量影响显著但效应量偏小，模型主要短板在节假日周。
+\end{abstract}
+
+\section{问题重述}
+
+给定 Walmart 45 家门店的周度销售记录，需要回答两个问题：一是哪些变量影响周销售额，影响的方向与强弱如何；
+二是如何对未来周销售额做出准确且稳健的预测。
+约束是只能使用时间上过去的信息，避免未来信息泄漏，同时评估口径要贴近业务。
+数据时间跨度约 2.7 年，门店数远多于时间点数，属于典型的面板（panel）结构。
+
+\section{数据清洗与处理}
+
+\subsection{数据集字段说明}
+
+数据共 8 个字段，均为门店--周粒度，各字段的含义与在建模中的角色见表 \ref{tab:fields}。
+
+\begin{table}[H]
+\centering
+\caption{数据集字段说明}
+\label{tab:fields}
+\small
+\begin{tabular}{llll}
+\toprule
+字段 & 类型 & 含义 & 建模角色 \\
+\midrule
+Store & 整数 & 门店编号（1--45） & 分组、固定效应 \\
+Date & 日期 & 周度日期（每周五） & 时间索引，派生时间特征 \\
+Weekly\_Sales & 浮点 & 该店该周销售额 & 目标变量 \\
+Holiday\_Flag & 0/1 & 是否节假日周 & 特征，并用于 WMAE 加权 \\
+Temperature & 浮点 & 当周平均气温（华氏度） & 外生特征 \\
+Fuel\_Price & 浮点 & 当周油价 & 外生特征 \\
+CPI & 浮点 & 消费者物价指数 & 外生特征 \\
+Unemployment & 浮点 & 失业率 & 外生特征 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+需要说明的是，数据集已经聚合到门店--周层级，不含部门明细，也不含门店的地理位置、商圈、人口密度等静态属性。
+这些未观测信息也是采用聚类分组的动机。
+
+\subsection{结构审计}
+
+对原始数据做完整性审计，结果为结构零损坏：无缺失值、无重复行、日期全部合法，
+主键（门店, 日期）唯一且构成完整的 $45\times143$ 面板。因此不需要删除或插补任何行。
+
+\subsection{极值、分段与损坏程度}
+
+面板数据的方差主要来自门店之间（\texttt{CPI} 为 99\%、\texttt{Weekly\_Sales} 为 94\%、
+\texttt{Unemployment} 为 91\%），若直接对合并数据使用 IQR 判据，会把门店规模差异误判为异常。
+改用门店内（within-store）判据后，各字段的异常情况见表 \ref{tab:outlier}。
+
+\begin{table}[H]
+\centering
+\caption{极值与损坏程度（门店内判据）}
+\label{tab:outlier}
+\small
+\begin{tabular}{lcccc}
+\toprule
+字段 & 门店内离群 & 门店内极端 & 等级 & 处理策略 \\
+\midrule
+Weekly\_Sales & 300 (4.66\%) & 154 (2.39\%) & L2 & 保留，log1p + 单独评估节假日 \\
+Unemployment & 32 (0.50\%) & 0 & L1 & 差分/去趋势，不删 \\
+CPI & 0 & 0 & L1 & 差分/去趋势 \\
+Temperature & 0 & 0 & L0 & 保留，分箱 \\
+Fuel\_Price & 0 & 0 & L0 & 保留 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\texttt{Weekly\_Sales} 的极端点中约 33.8\% 落在节假日周，属于真实的业务尖峰，予以保留。
+因此清洗的重点是去除混淆，即消解门店效应与时间趋势，而不是纠错。
+
+\subsection{数据预处理方式}
+
+\begin{itemize}[leftmargin=1.6em]
+  \item 日期解析：按 \texttt{\%d-\%m-\%Y} 解析为日期型，并派生年、月、周号、季度等时间特征；
+  \item 目标变换：对 \texttt{Weekly\_Sales} 做 $\log(1+y)$ 变换以削弱右偏，评价前用 Duan smearing 做偏差校正还原；
+  \item 平稳化：对 CPI、Unemployment 做差分或去趋势，缓解非平稳与共线；
+  \item 固定效应：以门店哑变量或组内去均值吸收门店固有水平差异；
+  \item 历史特征：在门店内构造滞后与滚动特征，严格只使用当前期之前的值；
+  \item 缺失处理：滞后特征在序列早期会产生缺失，按折用训练行中位数填充，避免跨越时间填充；
+  \item 缩尾：仅在训练折内对目标做缩尾，不触及验证与测试集；
+  \item 切分：所有评估均按时间切分，禁止随机打乱。
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.72\linewidth]{correlation_heatmap.png}
+\caption{主要变量间的 Pearson 相关热力图}
+\end{figure}
+
+\section{模型建立}
+
+\subsection{特征与目标变量选择}
+
+目标变量为 \texttt{Weekly\_Sales}。选择它是因为它直接刻画门店经营结果，
+且做 $\log(1+y)$ 变换后分布更接近对称，便于线性与树模型学习。
+
+特征分为三类。第一类是外生变量：\texttt{Temperature}、\texttt{Fuel\_Price}、\texttt{CPI}、
+\texttt{Unemployment} 与 \texttt{Holiday\_Flag}，用于刻画外部环境与节假日效应。
+第二类是时间特征：月、周号、季度，用于捕捉年度季节性。
+第三类是历史特征：门店内的一周、两周、四周、五十二周滞后，以及 4、8、13 周的滚动均值与标准差，
+用于刻画销售动量与近期波动。
+
+\texttt{Store} 不作为普通数值特征直接入模，避免把门店编号误当作有序变量；它通过门店哑变量或分组来使用。
+\texttt{Date} 不直接入模，而是派生为时间特征。含门店哑变量的设计矩阵维度为 63。
+
+\subsection{模型选型原则}
+
+按照从简到繁的路线推进：季节朴素、门店均值、Ridge，再到梯度提升（LightGBM 与 XGBoost）。
+每增加一层复杂度，都必须在滚动 CV 上证明有显著改善，否则回退到更简单的模型。
+
+\subsection{聚类的作用}
+
+数据集中并不包含门店的地理位置、商圈、人口密度和居民收入等信息，而这些因素会明显影响销售额。
+它们虽然无法直接观测，却会反映在门店销售序列的形态上，例如规模水位、季节性幅度、节假日响应和波动模式。
+DTW（动态时间规整）允许时间轴伸缩对齐，比欧氏距离更能刻画节奏相似的门店，
+因此用它度量门店序列之间的相似度，再用层次聚类把门店分成若干同类群。
+这样做相当于用可观测的销售形态，间接替代不可观测的地理与人口等隐藏变量，
+在共享样本量与保留门店差异之间取得折中。
+
+\begin{itemize}[leftmargin=1.6em]
+  \item 全局池化只训练一个模型，共享充分但忽略门店差异；
+  \item 单店建模训练 45 个模型，保留差异但每店仅 143 个样本，容易过拟合；
+  \item 簇级建模训练 5 个模型，是两者的折中，也是最终采用的最优方案。
+\end{itemize}
+
+\subsection{聚类与建模细节}
+
+对门店和周组成的 $\log(1+\text{销售额})$ 序列计算 $45\times45$ 的 DTW 距离矩阵，
+用平均连接（average linkage）做层次聚类，并以轮廓系数自动确定簇数，
+同时约束每簇不少于 5 家店，以排除离群店单独成簇的退化解。
+最终得到 $K=5$，簇规模为 $[7,11,11,9,7]$，各簇与门店规模大致对应。
+每个簇内汇总各门店的样本，训练一个浅层 XGBoost。
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{store_dtw_heatmap.png}
+\end{minipage}\hfill
+\begin{minipage}{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{dtw_silhouette.png}
+\end{minipage}
+\caption{左：按簇排序的门店 DTW 距离矩阵；右：轮廓系数随簇数的变化（最优 $K=5$）}
+\end{figure}
+
+\subsection{模型训练过程}
+
+训练的主要设置与流程如下。基学习器采用浅层 XGBoost，超参数见表 \ref{tab:xgb}，以限制模型容量、降低小样本下的过拟合风险。
+
+\begin{table}[H]
+\centering
+\caption{XGBoost 超参数}
+\label{tab:xgb}
+\small
+\begin{tabular}{ll}
+\toprule
+参数 & 取值 \\
+\midrule
+n\_estimators & 300 \\
+learning\_rate & 0.05 \\
+max\_depth & 3 \\
+min\_child\_weight & 5 \\
+subsample & 0.8 \\
+colsample\_bytree & 0.8 \\
+reg\_lambda & 1.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{itemize}[leftmargin=1.6em]
+  \item 目标：$\log(1+y)$；预测后按 Duan smearing 因子还原，$\hat{y}=\exp(\hat{z})\cdot\overline{\exp(e)}-1$；
+  \item 分组训练：对 5 个簇分别拟合一个模型，簇内门店样本合并使用，但不含门店哑变量；
+  \item 交叉验证：扩展窗口滚动原点 CV，共 5 折，每折验证 13 周，训练集只含验证期之前的数据；
+  \item 特征缺失：滞后特征在每折内用训练行中位数填充；
+  \item 复现性：随机种子固定为 42，线程数设为 1；
+  \item 预测：验证集门店按其所属簇调用对应模型，还原到原尺度后计算指标。
+\end{itemize}
+
+\subsection{验证策略}
+
+采用扩展窗口的滚动原点交叉验证，训练集只包含验证期之前的数据，验证段随时间前推；
+另外保留最后 13 周作末段留出终验。这样既避免了随机切分带来的未来信息泄漏，
+也能观察模型在不同时间段的稳定性。
+
+\section{模型评价指标}
+
+评价在原始金额尺度上进行，主要指标及其含义见表 \ref{tab:metrics}。
+其中 WMAE 为 Walmart 官方口径，节假日周权重为 5，是本次的主指标。
+MASE 以季节朴素（去年同周）为基准，取值小于 1 才说明优于该朴素方法。
+
+\begin{table}[H]
+\centering
+\caption{模型评价指标}
+\label{tab:metrics}
+\small
+\begin{tabular}{lll}
+\toprule
+指标 & 公式 & 值偏向 \\
+\midrule
+MAE & $\frac{1}{n}\sum|y-\hat{y}|$ & 越小越好 \\
+RMSE & $\sqrt{\frac{1}{n}\sum(y-\hat{y})^2}$ & 越小越好 \\
+WMAE & $\frac{\sum w_i|y_i-\hat{y}_i|}{\sum w_i}$，节假日 $w=5$ & 越小越好 \\
+WAPE & $\frac{\sum|y-\hat{y}|}{\sum|y|}$ & 越小越好 \\
+$R^2$ & $1-\frac{\sum(y-\hat{y})^2}{\sum(y-\bar{y})^2}$ & 越大越好 \\
+MASE & $\frac{\mathrm{MAE}}{\mathrm{MAE}_{\text{季节朴素}}}$ & 越小越好（$<1$ 优于朴素） \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{分析模块与模型对比}
+
+整个分析分为四个模块。数据探索模块考察变量分布与相关结构。训练模块覆盖基线模型、DTW 聚类与三层建模，
+并输出损失曲线。测试评估模块完成末段留出、分年份/节假日/温度/门店的分层评估，以及残差诊断和泄漏审计。
+模型解释模块使用固定效应回归（门店与年份固定效应、HC1 稳健标准误）、VIF 共线性诊断、SHAP 与线性特征权重。
+
+各模型在滚动 CV 下的总体指标对比如表 \ref{tab:compare}。
+
+\begin{table}[H]
+\centering
+\caption{滚动 CV 总体指标对比（按 WMAE 升序）}
+\label{tab:compare}
+\small
+\begin{tabular}{lcccc}
+\toprule
+模型 / 层级 & WMAE & WAPE & RMSE & $R^2$ \\
+\midrule
+B\_cluster（DTW+聚类+XGBoost） & 58{,}500 & 0.0472 & 77{,}775 & 0.9812 \\
+A\_global（全局池化+XGBoost） & 61{,}087 & 0.0506 & 81{,}769 & 0.9792 \\
+LightGBM（全局） & 62{,}580 & 0.0511 & 82{,}621 & 0.9788 \\
+季节朴素 & 62{,}770 & 0.0561 & 87{,}540 & 0.9762 \\
+C\_store（单店 XGBoost） & 68{,}138 & 0.0566 & 103{,}904 & 0.9665 \\
+Ridge（全局） & 100{,}321 & 0.0719 & 133{,}172 & 0.9449 \\
+Ridge（单店） & 103{,}936 & 0.0818 & 153{,}409 & 0.9269 \\
+门店均值 & 106{,}034 & 0.0885 & 167{,}017 & 0.9134 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.95\linewidth]{model_ranking.png}
+\caption{模型预测准确率排名（横向柱状图，按 WMAE 排序）}
+\end{figure}
+
+梯度提升整体优于线性模型。季节朴素的 $R^2$ 已达 0.976，说明门店规模与年度季节性主导了销售额；
+单店建模因样本过少而过拟合，整体表现最差。
+
+\section{可视化结果分析}
+
+变量分布图显示 \texttt{Weekly\_Sales} 明显右偏，取 $\log(1+y)$ 后接近对称，说明对数变换是合适的；
+气温呈双峰，反映南北门店的气候差异。
+
+相关热力图显示，各外生变量与销售额的线性相关都很弱，说明关系以非线性为主，
+这也是引入树模型和滞后特征的原因；油价与时间相关性较高，提示其带有明显的时间趋势。
+
+DTW 距离矩阵在按簇排序后呈现清晰的分块结构，轮廓系数在 $K=5$ 处最高，
+说明门店可以稳定地分为五类，且与门店规模层次对应。
+
+损失曲线中训练与验证 RMSE 同步下降并很快趋稳，两者间距不大，未出现明显过拟合。
+预测值与真实值的散点基本贴近对角线，时间序列图也吻合良好。
+残差近似零均值且左右对称，异方差主要来自门店之间量级的差异。
+
+SHAP 与标准化线性权重一致显示：上周销售额（\texttt{lag1}）的影响远大于其他特征，
+其次是 \texttt{lag2} 与滚动均值，宏观变量贡献很小。模型排名图则直观给出各模型的优劣次序。
+
+\begin{figure}[H]
+\centering
+\begin{minipage}{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{loss_curve_xgboost.png}
+\end{minipage}\hfill
+\begin{minipage}{0.49\linewidth}
+  \centering
+  \includegraphics[width=\linewidth]{linear_feature_weights.png}
+\end{minipage}
+\caption{左：XGBoost 训练与验证损失曲线；右：标准化线性模型特征权重}
+\end{figure}
+
+\section{最优结果}
+
+最优模型为 \texttt{B\_cluster}（DTW + 层次聚类 + XGBoost），结果见表 \ref{tab:best}。
+
+\begin{table}[H]
+\centering
+\caption{最优模型结果}
+\label{tab:best}
+\small
+\begin{tabular}{lcccccc}
+\toprule
+场景 & WMAE & WAPE & MAE & RMSE & $R^2$ & MASE \\
+\midrule
+滚动 CV（汇总） & 58{,}500 & 0.0472 & -- & 77{,}775 & 0.9812 & -- \\
+末段留出（13 周） & 35{,}977 & 0.0329 & 33{,}842 & 49{,}144 & 0.9913 & 0.6417 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+门店级 WAPE 的中位数为 0.0317，P90 为 0.0476，最差门店为 0.0692，均低于 7\%。
+模型不仅在整体上表现良好，在最差门店上也保持稳健，这是簇级建模相对全局模型的主要优势。
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{pred_vs_actual.png}\\[0.6em]
+\includegraphics[width=\linewidth]{residual_distribution.png}
+\caption{上：末段留出的预测值与真实值对比；下：残差分布}
+\end{figure}
+
+\subsection{影响因素}
+
+固定效应回归给出的 $\log$ 空间系数（可近似看作弹性）为：节假日 $+5.1\%$、
+失业率 $-3.9\%$ 每百分点、油价 $+3.4\%$、CPI $+1.3\%$、气温 $-0.08\%$ 每华氏度；
+各项 VIF 均小于 1.25，不存在多重共线性。SHAP 显示预测上真正起主导作用的是门店自身历史，
+\texttt{lag1}（上周销售额）远高于 \texttt{lag2}、滚动均值、周号与 \texttt{lag52}，宏观变量的贡献很小，
+各特征的影响程度见附录表 \ref{tab:shap}。
+两种证据相互印证：节假日对销售额有正向作用，宏观变量统计显著但效应量小，
+销售额首要由自身动量、门店规模与年度季节性决定。
+
+\section{模型优点与不足}
+
+模型的主要优点有四点。其一，整个评估建立在无泄漏的滚动 CV 之上，训练只使用过去信息，
+再配合末段留出，结论较为可信。其二，簇级建模在共享样本量与保留门店差异之间取得平衡，
+不仅整体最优，最差门店的表现也最好。其三，通过对数变换与门店固定效应，较好地处理了目标的右偏与门店异质。
+其四，解释与预测并重，固定效应回归与 SHAP 相互印证，使影响因素的方向与强弱都有依据。
+
+不足也有几点。一是节假日周仍是短板，在这类周上模型甚至不如季节朴素，说明节假日尖峰还没有被充分刻画。
+二是聚类基于整段序列进行。三是 DTW 的距离矩阵复杂度为 $O(N^2)$，门店数量增大时计算开销明显。
+四是数据集缺少门店静态属性，聚类只是间接替代。五是当前验证为提前一周的单步预测。
+六是单店样本量有限，未采用完全个性化建模，簇级方案是在此约束下的折中。
+
+\section{总结}
+
+数据在结构上没有损坏，但统计上高度异质，清洗的核心是去混淆而非纠错。
+建模上采用 DTW + 层次聚类 + XGBoost 的三层方案，用销售形态间接替代不可观测的地理与人口等信息。
+最优模型 \texttt{B\_cluster} 在滚动 CV 和末段留出上均表现最好，最差门店的结果也最稳。
+影响因素方面，销售额主要由自身历史动量、门店规模与年度季节性决定，宏观变量显著但效应量小。
+当前的主要短板在节假日周。
+
+\appendix
+\section{详细图表}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.85\linewidth]{shap_beeswarm.png}
+\caption{XGBoost 特征 SHAP 蜂群图（特征集与最优模型一致，不含门店哑变量）}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.9\linewidth]{variable_distributions.png}
+\caption{主要变量的分布}
+\end{figure}
+
+\noindent
+图6 的纵轴列出了全部参与建模的特征。除 \texttt{Holiday\_Flag}、\texttt{Fuel\_Price}、
+\texttt{Temperature} 等原始字段外，其余都是本项目新增的构造特征。
+\texttt{lag} 类表示门店自身的历史销售额，即前若干周的 $\log(1+y)$；
+\texttt{roll\_mean} 与 \texttt{roll\_std} 分别表示前若干周的滚动均值与滚动标准差，用于刻画近期水平与波动；
+\texttt{month}、\texttt{week}、\texttt{quarter} 由日期派生，用于捕捉年度季节性。
+所有 \texttt{lag} 与 \texttt{roll} 特征都在门店内构造，且只使用当前期之前的值。
+各特征对销售额预测的影响程度见表 \ref{tab:shap}。
+
+\begin{table}[H]
+\centering
+\caption{各特征对销售额预测的影响程度（平均绝对 SHAP 值）}
+\label{tab:shap}
+\small
+\begin{tabular}{llcc}
+\toprule
+特征 & 含义 & 平均绝对 SHAP & 影响程度 \\
+\midrule
+lag1 & 前 1 周销售额 & 0.3161 & 最高 \\
+lag2 & 前 2 周销售额 & 0.1077 & 高 \\
+roll\_mean4 & 前 4 周滚动均值 & 0.0404 & 中 \\
+lag4 & 前 4 周销售额 & 0.0344 & 中 \\
+week & 周号 & 0.0216 & 中 \\
+lag52 & 前 52 周（去年同周）销售额 & 0.0115 & 低 \\
+roll\_std4 & 前 4 周滚动标准差 & 0.0104 & 低 \\
+month & 月份 & 0.0078 & 低 \\
+Holiday\_Flag & 是否节假日 & 0.0046 & 低 \\
+roll\_std8 & 前 8 周滚动标准差 & 0.0034 & 低 \\
+roll\_mean8 & 前 8 周滚动均值 & 0.0033 & 低 \\
+Fuel\_Price & 油价 & 0.0024 & 低 \\
+roll\_mean13 & 前 13 周滚动均值 & 0.0023 & 低 \\
+roll\_std13 & 前 13 周滚动标准差 & 0.0019 & 低 \\
+Temperature & 气温 & 0.0015 & 低 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+可以看到，对销售额影响最大的是门店自身的近期历史（\texttt{lag1}、\texttt{lag2}、\texttt{roll\_mean4}），
+其次是与年度季节性有关的 \texttt{week}、\texttt{lag52} 和 \texttt{month}；
+节假日、油价、气温等原始外生变量的影响相对较小。
+这与正文固定效应回归的结论一致：节假日、失业率等原始字段在统计上显著，但效应量不大。
+
+\section{术语表}
+
+\small
+\begin{longtable}{p{2.3cm} p{4.6cm} p{7.3cm}}
+\caption{术语与缩写说明}\\
+\toprule
+术语 / 缩写 & 全称 & 说明 \\
+\midrule
+\endfirsthead
+\toprule
+术语 / 缩写 & 全称 & 说明 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+MAE & Mean Absolute Error & 平均绝对误差。 \\
+RMSE & Root Mean Squared Error & 均方根误差。 \\
+WMAE & Weighted Mean Absolute Error & 加权平均绝对误差，节假日周权重为 5，本次主指标。 \\
+WAPE & Weighted Absolute Percentage Error & 整体绝对百分比误差，$\sum|y-\hat{y}|/\sum|y|$。 \\
+$R^2$ & Coefficient of Determination & 决定系数，$1-\mathrm{SS}_{res}/\mathrm{SS}_{tot}$，越大越好。 \\
+MASE & Mean Absolute Scaled Error & 相对季节朴素的缩放误差，小于 1 表示优于季节朴素。 \\
+DTW & Dynamic Time Warping & 动态时间规整，允许时间轴伸缩对齐的序列距离。 \\
+层次聚类 & Hierarchical Clustering & 逐步合并样本的聚类方法，本次采用平均连接。 \\
+轮廓系数 & Silhouette Coefficient & 聚类质量指标，取值 $[-1,1]$，越大表示分簇越清晰。 \\
+XGBoost & Extreme Gradient Boosting & 带正则化的梯度提升树算法。 \\
+LightGBM & Light Gradient Boosting Machine & 采用直方图分箱与叶子优先生长的高效梯度提升树实现。 \\
+SHAP & SHapley Additive exPlanations & 基于博弈论的特征贡献分解，用于解释模型。 \\
+VIF & Variance Inflation Factor & 方差膨胀因子，用于诊断多重共线性。 \\
+HC1 & Heteroskedasticity-Consistent 1 & 异方差稳健标准误，用于回归系数的推断。 \\
+固定效应 & Fixed Effects & 为每个个体设置专属截距，吸收其固有差异，此处用于门店。 \\
+池化 & Pooling & 将多个主体的样本合并后训练同一个模型。 \\
+滚动原点 CV & Rolling-origin Cross Validation & 训练集只含过去信息、验证段随时间前推的交叉验证。 \\
+扩展窗口 & Expanding Window & 训练集随时间递增的窗口设置。 \\
+面板数据 & Panel Data & 多个主体在多个时期上的二维数据。 \\
+Duan smearing & Duan Smearing Estimator & 对数模型还原到原尺度时的偏差校正方法。 \\
+log1p & $\log(1+y)$ & 对右偏目标做对数变换，缓解长尾。 \\
+缩尾 & Winsorization & 将极端值截断到分位点，降低离群点影响。 \\
+季节朴素 & Seasonal Naive & 用去年同周的销售额作为预测，作为强基线。 \\
+\end{longtable}
+
+\end{document}

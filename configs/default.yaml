@@ -1,0 +1,71 @@
+seed: 42
+threads: 1
+runs_dir: runs
+
+data:
+  path: practice_1.csv
+  date_col: Date
+  date_format: "%d-%m-%Y"
+  target: Weekly_Sales
+  store_col: Store
+  holiday_col: Holiday_Flag
+
+features:
+  exogenous: [Temperature, Fuel_Price, CPI, Unemployment, Holiday_Flag]
+  time_features: [month, week, quarter]
+  lag_features: [1, 2, 4, 52]
+  rolling_windows: [4, 8, 13]
+  log_target: true
+  store_fixed_effects: true
+
+validation:
+  n_splits: 5
+  test_size: 13
+  min_train: 52
+  gap: 0
+  expanding: true
+
+final_holdout:
+  test_size: 13
+  gap: 0
+
+models:
+  - seasonal_naive
+  - store_mean
+  - ridge_global
+  - ridge_store
+  - lightgbm
+  - xgboost
+
+ridge:
+  alpha: 1.0
+
+lightgbm:
+  n_estimators: 300
+  learning_rate: 0.05
+  max_depth: 3
+  num_leaves: 7
+  min_child_samples: 20
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+
+xgboost:
+  n_estimators: 300
+  learning_rate: 0.05
+  max_depth: 3
+  min_child_weight: 5
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+
+comparison:
+  reference: seasonal_naive
+  alpha: 0.05
+
+dtw:
+  normalize: false
+  band: null
+  k_min: 2
+  k_max: 10
+  min_cluster_size: 5

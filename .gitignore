@@ -1,0 +1,42 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# ---- C++ / pybind11 构建产物 ----
+cpp/build/
+*.o
+*.obj
+*.so
+*.so.*
+
+# ---- LaTeX 中间文件（保留 report.pdf）----
+report/*.aux
+report/*.log
+report/*.out
+report/*.toc
+report/*.fls
+report/*.fdb_latexmk
+report/*.synctex.gz
+report/*.bbl
+report/*.blg
+report/*.nav
+report/*.snm
+
+# ---- 生成的产物（可由脚本重跑复现）----
+output/*
+!output/README.md
+runs/
+practice_1.xlsx
+
+# ---- 编辑器 / 操作系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
