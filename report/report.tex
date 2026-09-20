@@ -127,12 +127,6 @@ Fuel\_Price & 0 & 0 & L0 & 保留 \\
   \item 切分：所有评估均按时间切分，禁止随机打乱。
 \end{itemize}
 
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.72\linewidth]{correlation_heatmap.png}
-\caption{主要变量间的 Pearson 相关热力图}
-\end{figure}
-
 \section{模型建立}
 
 \subsection{特征与目标变量选择}
@@ -175,7 +169,7 @@ DTW（动态时间规整）允许时间轴伸缩对齐，比欧氏距离更能�
 用平均连接（average linkage）做层次聚类，并以轮廓系数自动确定簇数，
 同时约束每簇不少于 5 家店，以排除离群店单独成簇的退化解。
 最终得到 $K=5$，簇规模为 $[7,11,11,9,7]$，各簇与门店规模大致对应。
-每个簇内汇总各门店的样本，训练一个浅层 XGBoost。
+每个簇内汇总各门店的样本，训练一个浅层 XGBoost。门店聚类的结果见图 \ref{fig:dtw}。
 
 \begin{figure}[H]
 \centering
@@ -188,6 +182,7 @@ DTW（动态时间规整）允许时间轴伸缩对齐，比欧氏距离更能�
   \includegraphics[width=\linewidth]{dtw_silhouette.png}
 \end{minipage}
 \caption{左：按簇排序的门店 DTW 距离矩阵；右：轮廓系数随簇数的变化（最优 $K=5$）}
+\label{fig:dtw}
 \end{figure}
 
 \subsection{模型训练过程}
@@ -287,23 +282,31 @@ Ridge（单店） & 103{,}936 & 0.0818 & 153{,}409 & 0.9269 \\
 \centering
 \includegraphics[width=0.95\linewidth]{model_ranking.png}
 \caption{模型预测准确率排名（横向柱状图，按 WMAE 排序）}
+\label{fig:rank}
 \end{figure}
 
 梯度提升整体优于线性模型。季节朴素的 $R^2$ 已达 0.976，说明门店规模与年度季节性主导了销售额；
-单店建模因样本过少而过拟合，整体表现最差。
+单店建模因样本过少而过拟合，整体表现最差。各模型在四个指标上的排名见图 \ref{fig:rank}。
 
 \section{可视化结果分析}
 
-变量分布图显示 \texttt{Weekly\_Sales} 明显右偏，取 $\log(1+y)$ 后接近对称，说明对数变换是合适的；
+变量分布图（图 \ref{fig:dist}）显示 \texttt{Weekly\_Sales} 明显右偏，取 $\log(1+y)$ 后接近对称，说明对数变换是合适的；
 气温呈双峰，反映南北门店的气候差异。
 
-相关热力图显示，各外生变量与销售额的线性相关都很弱，说明关系以非线性为主，
+相关热力图（图 \ref{fig:corr}）显示，各外生变量与销售额的线性相关都很弱，说明关系以非线性为主，
 这也是引入树模型和滞后特征的原因；油价与时间相关性较高，提示其带有明显的时间趋势。
 
-DTW 距离矩阵在按簇排序后呈现清晰的分块结构，轮廓系数在 $K=5$ 处最高，
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.72\linewidth]{correlation_heatmap.png}
+\caption{主要变量间的 Pearson 相关热力图}
+\label{fig:corr}
+\end{figure}
+
+DTW 距离矩阵（图 \ref{fig:dtw}）在按簇排序后呈现清晰的分块结构，轮廓系数在 $K=5$ 处最高，
 说明门店可以稳定地分为五类，且与门店规模层次对应。
 
-损失曲线中训练与验证 RMSE 同步下降并很快趋稳，两者间距不大，未出现明显过拟合。
+损失曲线（图 \ref{fig:loss}）中训练与验证 RMSE 同步下降并很快趋稳，两者间距不大，未出现明显过拟合。
 预测值与真实值的散点基本贴近对角线，时间序列图也吻合良好。
 残差近似零均值且左右对称，异方差主要来自门店之间量级的差异。
 
@@ -321,6 +324,7 @@ SHAP 与标准化线性权重一致显示：上周销售额（\texttt{lag1}）�
   \includegraphics[width=\linewidth]{linear_feature_weights.png}
 \end{minipage}
 \caption{左：XGBoost 训练与验证损失曲线；右：标准化线性模型特征权重}
+\label{fig:loss}
 \end{figure}
 
 \section{最优结果}
@@ -345,12 +349,14 @@ SHAP 与标准化线性权重一致显示：上周销售额（\texttt{lag1}）�
 \noindent
 门店级 WAPE 的中位数为 0.0317，P90 为 0.0476，最差门店为 0.0692，均低于 7\%。
 模型不仅在整体上表现良好，在最差门店上也保持稳健，这是簇级建模相对全局模型的主要优势。
+末段留出的预测值与真实值对比及残差分布见图 \ref{fig:pred}。
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=\linewidth]{pred_vs_actual.png}\\[0.6em]
 \includegraphics[width=\linewidth]{residual_distribution.png}
 \caption{上：末段留出的预测值与真实值对比；下：残差分布}
+\label{fig:pred}
 \end{figure}
 
 \subsection{影响因素}
@@ -390,16 +396,18 @@ SHAP 与标准化线性权重一致显示：上周销售额（\texttt{lag1}）�
 \centering
 \includegraphics[width=0.85\linewidth]{shap_beeswarm.png}
 \caption{XGBoost 特征 SHAP 蜂群图（特征集与最优模型一致，不含门店哑变量）}
+\label{fig:shap}
 \end{figure}
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=0.9\linewidth]{variable_distributions.png}
 \caption{主要变量的分布}
+\label{fig:dist}
 \end{figure}
 
 \noindent
-图6 的纵轴列出了全部参与建模的特征。除 \texttt{Holiday\_Flag}、\texttt{Fuel\_Price}、
+图 \ref{fig:shap} 的纵轴列出了全部参与建模的特征。除 \texttt{Holiday\_Flag}、\texttt{Fuel\_Price}、
 \texttt{Temperature} 等原始字段外，其余都是本项目新增的构造特征。
 \texttt{lag} 类表示门店自身的历史销售额，即前若干周的 $\log(1+y)$；
 \texttt{roll\_mean} 与 \texttt{roll\_std} 分别表示前若干周的滚动均值与滚动标准差，用于刻画近期水平与波动；
